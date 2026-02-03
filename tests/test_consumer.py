@@ -22,7 +22,7 @@ class MockAsyncConsumer:
     @pytest.fixture
     def stub_mq_config(self) -> models.RabbitMQConfig:
         return models.RabbitMQConfig(
-            broker_dns='amqp://foo:bar@test:1234',
+            broker_dsn='amqp://foo:bar@test:1234',
             queue_name='test_queue',
             prefetch_limit=1,
             max_reconnect_attempts=5,

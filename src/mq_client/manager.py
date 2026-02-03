@@ -29,7 +29,7 @@ class RabbitMQAsyncConnectionManager:
 
         while attempt < self.mq_config.max_reconnect_attempts:
             try:
-                self.connection = await aio_pika.connect_robust(self.mq_config.broker_dns)
+                self.connection = await aio_pika.connect_robust(self.mq_config.broker_dsn)
                 self.channel = await self.connection.channel()
                 await self.channel.set_qos(prefetch_count=self.mq_config.prefetch_limit)
                 await self.channel.declare_queue(self.mq_config.queue_name, durable=True)

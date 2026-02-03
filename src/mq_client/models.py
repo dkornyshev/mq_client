@@ -14,7 +14,7 @@ StrongAmqpDsn: typing.TypeAlias = typing.Annotated[
 ]
 
 
-def validate_amqp_dns(amqp_dsn_string: str) -> str:
+def validate_amqp_dsn(amqp_dsn_string: str) -> str:
     amqp_dsn_adapter = pydantic.TypeAdapter(StrongAmqpDsn)
     amqp_dsn: pydantic.AmqpDsn = amqp_dsn_adapter.validate_python(amqp_dsn_string)
 
@@ -31,7 +31,7 @@ def validate_amqp_dns(amqp_dsn_string: str) -> str:
 class RabbitMQConfig(pydantic.BaseModel):
     """Модель конфигурации брокера сообщений."""
 
-    broker_dns: typing.Annotated[str, pydantic.AfterValidator(validate_amqp_dns)]  #: Строка подключения к брокеру MQ
+    broker_dsn: typing.Annotated[str, pydantic.AfterValidator(validate_amqp_dsn)]  #: Строка подключения к брокеру MQ
     queue_name: str  #: Имя очереди сообщений
     prefetch_limit: int  #: Ограничение предварительной выборки
     max_reconnect_attempts: int  #: Максимальное число попыток подключения
