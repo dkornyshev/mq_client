@@ -30,6 +30,10 @@ class MockAsyncConsumer:
         )
 
     @pytest.fixture
+    def stub_mq_consumer(self, stub_mq_config: models.RabbitMQConfig) -> consumer.AsyncConsumer:
+        return consumer.AsyncConsumer(stub_mq_config)
+
+    @pytest.fixture
     def mock_callback(self, mocker: pytest_mock.MockFixture) -> typing.Any:
         return mocker.AsyncMock()
 
@@ -56,9 +60,9 @@ class MockAsyncConsumer:
         async def msg_generator():
             yield mock_message
 
-        return mocker.NonCallableMock(
+        return mocker.AsyncMock(
             spec=aio_pika.abc.AbstractQueue,
-            iterator = mocker.PropertyMock(
+            iterator=mocker.PropertyMock(
                 return_value=mocker.AsyncMock(
                     spec=aio_pika.abc.AbstractQueueIterator,
                     __aenter__=mocker.AsyncMock(return_value=msg_generator()),
@@ -72,24 +76,37 @@ class MockAsyncConsumer:
         mock_async_queue: aio_pika.abc.AbstractQueue,
         mocker: pytest_mock.MockFixture,
     ) -> typing.Any:
-        return mocker.NonCallableMock(
+        return mocker.AsyncMock(
             spec=aio_pika.abc.AbstractRobustChannel,
             is_closed=mocker.Mock(return_value=False),
             get_queue=mocker.AsyncMock(return_value=mock_async_queue),
         )
 
     @pytest.fixture
-    def mock_async_connection_manager(
+    def mock_async_connection(
         self,
         mock_async_channel: aio_pika.abc.AbstractRobustChannel,
         mocker: pytest_mock.MockFixture,
     ) -> typing.Any:
-        return mocker.NonCallableMock(
-            spec_set=manager.RabbitMQAsyncConnectionManager,
-            get_channel=mocker.AsyncMock(
-                spec_set=manager.RabbitMQAsyncConnectionManager.get_channel,
-                side_effect=[mock_async_channel],
-            ),
+        return mocker.AsyncMock(
+            spec=aio_pika.abc.AbstractRobustConnection,
+            channel=mocker.Mock(return_value=mock_async_channel),
+            is_closed=mocker.Mock(return_value=False),
+            close=mocker.AsyncMock(),
+        )
+
+
+    @pytest.fixture
+    def mock_async_connection_manager(
+        self,
+        mock_async_connection: aio_pika.abc.AbstractRobustConnection,
+        mock_async_channel: aio_pika.abc.AbstractRobustChannel,
+        mocker: pytest_mock.MockFixture,
+    ) -> typing.Any:
+        return mocker.AsyncMock(
+            spec=manager.RabbitMQAsyncConnectionManager,
+            connection=mock_async_connection,
+            get_channel=mocker.AsyncMock(return_value=mock_async_channel),
         )
 
     @pytest.fixture(autouse=True)
@@ -98,11 +115,30 @@ class MockAsyncConsumer:
         mock_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
         mocker: pytest_mock.MockFixture,
     ) -> typing.Any:
-        return mocker.patch.object(
-            manager,
-            attribute='RabbitMQAsyncConnectionManager',
-            side_effect=[mock_async_connection_manager],
+        return mocker.patch(
+            'mq_client.manager.RabbitMQAsyncConnectionManager',
+            return_value=mock_async_connection_manager,
         )
+
+    @pytest.fixture
+    def patch_consuming_attribute(
+        self,
+        stub_mq_consumer: consumer.AsyncConsumer,
+        mocker: pytest_mock.MockFixture,
+    ) -> typing.Any:
+        class _AlmostAlwaysTrue:
+            def __init__(self, total_iterations: int = 1) -> None:
+                self.total_iterations = total_iterations
+                self.current_iteration = 0
+
+            def __bool__(self) -> bool:
+                if self.current_iteration < self.total_iterations:
+                    self.current_iteration += 1
+                    return bool(1)
+
+                return bool(0)
+
+        return mocker.patch.object(stub_mq_consumer, '_consuming', new=_AlmostAlwaysTrue(1))
 
     @pytest.fixture
     def caplog(self, caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
@@ -112,37 +148,36 @@ class MockAsyncConsumer:
 
 class TestAsyncConsumer(MockAsyncConsumer):
 
-    async def test_consumer(self, stub_mq_config: models.RabbitMQConfig) -> None:
-        mq_consumer = consumer.AsyncConsumer(stub_mq_config)
-
-        assert mq_consumer.queue_name == 'test_queue'
-        assert mq_consumer.connection_manager is not None
+    async def test_consumer(self, stub_mq_consumer: consumer.AsyncConsumer) -> None:
+        assert stub_mq_consumer.queue_name == 'test_queue'
+        assert stub_mq_consumer.connection_manager is not None
 
     async def test_start_consuming_normal_flow(
         self,
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_consumer: consumer.AsyncConsumer,
+        patch_consuming_attribute: unittest.mock.MagicMock,
+        mock_async_connection: aio_pika.abc.AbstractRobustConnection,
         mock_async_channel: aio_pika.abc.AbstractRobustChannel,
         mock_callback: unittest.mock.AsyncMock,
         mocker: pytest_mock.MockFixture,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        mq_consumer = consumer.AsyncConsumer(stub_mq_config)
-        await mq_consumer.start_consuming(mock_callback)
+        await stub_mq_consumer.start_consuming(mock_callback)
 
         assert mock_async_channel.get_queue.call_args == mocker.call('test_queue')
         assert mock_callback.call_count == 1
 
     async def test_start_consuming_json_decode_error(
         self,
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_consumer: consumer.AsyncConsumer,
+        patch_consuming_attribute: unittest.mock.MagicMock,
         mock_message: aio_pika.abc.AbstractIncomingMessage,
         mock_callback: unittest.mock.AsyncMock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         mock_message.body = b"invalid json"
 
-        mq_consumer = consumer.AsyncConsumer(stub_mq_config)
-        await mq_consumer.start_consuming(mock_callback)
+        await stub_mq_consumer.start_consuming(mock_callback)
 
         assert caplog.record_tuples == [
             (LOG_NAME, logging.ERROR, 'Failed to decode message: Expecting value: line 1 column 1 (char 0)'),
@@ -152,24 +187,25 @@ class TestAsyncConsumer(MockAsyncConsumer):
 
     async def test_start_consuming_callback_error(
         self,
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_consumer: consumer.AsyncConsumer,
+        patch_consuming_attribute: unittest.mock.MagicMock,
         mock_message: aio_pika.abc.AbstractIncomingMessage,
         mock_callback: unittest.mock.AsyncMock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        unknown_error = ValueError('foo')
+        unknown_error = ValueError('some error')
         mock_callback.side_effect = [unknown_error]
 
-        mq_consumer = consumer.AsyncConsumer(stub_mq_config)
-        await mq_consumer.start_consuming(mock_callback)
+        await stub_mq_consumer.start_consuming(mock_callback)
 
         assert caplog.record_tuples == [
-            (LOG_NAME, logging.ERROR, 'Error processing message: foo'),
+            (LOG_NAME, logging.ERROR, 'Error processing message: some error'),
         ]
 
     async def test_start_consuming_get_channel_error(
         self,
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_consumer: consumer.AsyncConsumer,
+        patch_consuming_attribute: unittest.mock.MagicMock,
         mock_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
         mock_callback: unittest.mock.AsyncMock,
         caplog: pytest.LogCaptureFixture,
@@ -177,9 +213,7 @@ class TestAsyncConsumer(MockAsyncConsumer):
         get_channel_error = aio_pika.exceptions.AMQPError('some error')
         mock_async_connection_manager.get_channel.side_effect = [get_channel_error]
 
-        mq_consumer = consumer.AsyncConsumer(stub_mq_config)
-        with pytest.raises(aio_pika.exceptions.AMQPError):
-            await mq_consumer.start_consuming(mock_callback)
+        await stub_mq_consumer.start_consuming(mock_callback)
 
         assert caplog.record_tuples == [
             (LOG_NAME, logging.ERROR, 'Failed to consume events from RabbitMQ: some error'),
@@ -188,30 +222,46 @@ class TestAsyncConsumer(MockAsyncConsumer):
     @pytest.mark.asyncio
     async def test_start_consuming_unknown_error(
         self,
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_consumer: consumer.AsyncConsumer,
+        patch_consuming_attribute: unittest.mock.MagicMock,
         mock_async_channel: aio_pika.abc.AbstractRobustChannel,
         mock_callback: unittest.mock.AsyncMock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        unknown_error = ValueError('foo')
+        unknown_error = ValueError('some error')
         mock_async_channel.get_queue.side_effect = [unknown_error]
 
-        mq_consumer = consumer.AsyncConsumer(stub_mq_config)
-        with pytest.raises(ValueError, match='foo') as exc_info:
-            await mq_consumer.start_consuming(mock_callback)
+        await stub_mq_consumer.start_consuming(mock_callback)
 
-        assert exc_info.value is unknown_error
         assert caplog.record_tuples == [
-            (LOG_NAME, logging.CRITICAL, 'Unexpected error: foo'),
+            (LOG_NAME, logging.CRITICAL, 'Unexpected error: some error'),
         ]
 
     async def test_start_consuming_message_process(
         self,
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_consumer: consumer.AsyncConsumer,
+        patch_consuming_attribute: unittest.mock.MagicMock,
         mock_message: aio_pika.abc.AbstractIncomingMessage,
         mock_callback: unittest.mock.AsyncMock,
     ) -> None:
-        mq_consumer = consumer.AsyncConsumer(stub_mq_config)
-        await mq_consumer.start_consuming(mock_callback)
+        await stub_mq_consumer.start_consuming(mock_callback)
 
         assert mock_message.process.call_count == 1
+
+    async def test_stop_consuming(
+        self,
+        stub_mq_consumer: consumer.AsyncConsumer,
+        mock_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        assert stub_mq_consumer._consuming is True
+
+        await stub_mq_consumer.stop_consuming()
+
+        assert stub_mq_consumer._consuming is False
+
+        assert caplog.record_tuples == [
+            (LOG_NAME, logging.INFO, 'Consumption has been stopped'),
+        ]
+
+        assert mock_async_connection_manager.disconnect.call_count == 1
