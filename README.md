@@ -1,1 +1,2 @@
-# RabbitMQ Interaction Client
+# MQ Client
+**Клиент взаимодействия с шиной данных RabbitMQ**
