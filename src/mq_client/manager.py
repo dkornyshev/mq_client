@@ -15,9 +15,14 @@ logger = logging.getLogger(__name__)
 class RabbitMQAsyncConnectionManager:
     """Менеджер соединений с RabbitMQ."""
 
-    def __init__(self, mq_config: models.RabbitMQConfig) -> None:
+    def __init__(
+        self,
+        mq_config: models.RabbitMQConfig,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
         """Создать экземпляр менеджера соединений."""
         self.mq_config = mq_config
+        self.loop = loop
 
         self.connection: aio_pika.abc.AbstractRobustConnection | None = None
         self.channel: aio_pika.abc.AbstractRobustChannel | None = None
@@ -29,7 +34,7 @@ class RabbitMQAsyncConnectionManager:
 
         while attempt < self.mq_config.max_reconnect_attempts:
             try:
-                self.connection = await aio_pika.connect_robust(self.mq_config.broker_dsn)
+                self.connection = await aio_pika.connect_robust(self.mq_config.broker_dsn, loop=self.loop)
                 self.channel = await self.connection.channel()
                 await self.channel.set_qos(prefetch_count=self.mq_config.prefetch_limit)
                 await self.channel.declare_queue(self.mq_config.queue_name, durable=True)
@@ -42,6 +47,7 @@ class RabbitMQAsyncConnectionManager:
 
                 delay = self.mq_config.reconnect_delay * (2 ** (attempt - 1))
                 logger.error(f'AMQP Connection Error: {e}. Retrying in {delay} seconds...')
+                asyncio.get_event_loop()
                 await asyncio.sleep(delay)
 
             except Exception as e:

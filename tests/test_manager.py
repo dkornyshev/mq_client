@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import typing
 import unittest.mock
@@ -50,6 +51,10 @@ class MockRabbitMQAsyncConnectionManager:
         )
 
     @pytest.fixture
+    def mock_event_loop(self, mocker: pytest_mock.MockFixture) -> asyncio.AbstractEventLoop:
+        return mocker.AsyncMock(spec=asyncio.AbstractEventLoop)
+
+    @pytest.fixture
     def patch_connect_robust(
         self,
         mocker: pytest_mock.MockFixture,
@@ -61,6 +66,14 @@ class MockRabbitMQAsyncConnectionManager:
                 spec=aio_pika.connect_robust,
             ),
         )
+
+    @pytest.fixture(autouse=True)
+    def patch_get_event_loop(
+        self,
+        mocker: pytest_mock.MockFixture,
+        mock_event_loop: asyncio.AbstractEventLoop,
+    ) -> typing.Any:
+        return mocker.patch('asyncio.get_event_loop', return_value=mock_event_loop)
 
     @pytest.fixture(autouse=True)
     def patch_sleep(self, mocker: pytest_mock.MockFixture) -> typing.Any:
@@ -77,13 +90,30 @@ class TestRabbitMQAsyncConnectionManager(MockRabbitMQAsyncConnectionManager):
     def test_manager(self, stub_mq_config: models.RabbitMQConfig) -> None:
         mq_manager = manager.RabbitMQAsyncConnectionManager(stub_mq_config)
 
+        assert mq_manager.mq_config == stub_mq_config
+        assert mq_manager.loop is None
+
+        assert mq_manager.connection is None
+        assert mq_manager.channel is None
+
+    def test_manager_with_loop(
+        self,
+        stub_mq_config: models.RabbitMQConfig,
+        mock_event_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        mq_manager = manager.RabbitMQAsyncConnectionManager(stub_mq_config, mock_event_loop)
+
+        assert mq_manager.mq_config == stub_mq_config
+        assert mq_manager.loop is mock_event_loop
+
         assert mq_manager.connection is None
         assert mq_manager.channel is None
 
     async def test_connect(
         self,
         stub_mq_config: models.RabbitMQConfig,
-        patch_connect_robust: unittest.mock.AsyncMock,
+        patch_connect_robust: unittest.mock.MagicMock,
+        patch_get_event_loop: unittest.mock.MagicMock,
         mock_async_connection: aio_pika.abc.AbstractRobustConnection,
         mock_async_channel: aio_pika.abc.AbstractRobustChannel,
         mocker: pytest_mock.MockFixture,
@@ -101,7 +131,35 @@ class TestRabbitMQAsyncConnectionManager(MockRabbitMQAsyncConnectionManager):
             (LOG_NAME, logging.INFO, 'Successfully connected to RabbitMQ'),
         ]
 
-        assert patch_connect_robust.call_args == mocker.call('amqp://foo:bar@test:1234/')
+        assert patch_connect_robust.call_args == mocker.call('amqp://foo:bar@test:1234/', loop=None)
+        assert patch_get_event_loop.call_count == 1
+        assert mock_async_connection.channel.call_args == mocker.call()
+        assert mock_async_channel.set_qos.call_args == mocker.call(prefetch_count=1)
+        assert mock_async_channel.declare_queue.call_args == mocker.call('test_queue', durable=True)
+
+    async def test_connect_with_loop(
+        self,
+        stub_mq_config: models.RabbitMQConfig,
+        patch_connect_robust: unittest.mock.MagicMock,
+        mock_event_loop: asyncio.AbstractEventLoop,
+        mock_async_connection: aio_pika.abc.AbstractRobustConnection,
+        mock_async_channel: aio_pika.abc.AbstractRobustChannel,
+        mocker: pytest_mock.MockFixture,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        patch_connect_robust.return_value = mock_async_connection
+
+        mq_manager = manager.RabbitMQAsyncConnectionManager(stub_mq_config, mock_event_loop)
+        await mq_manager.connect()
+
+        assert isinstance(mq_manager.connection, aio_pika.abc.AbstractRobustConnection)
+        assert isinstance(mq_manager.channel, aio_pika.abc.AbstractRobustChannel)
+
+        assert caplog.record_tuples == [
+            (LOG_NAME, logging.INFO, 'Successfully connected to RabbitMQ'),
+        ]
+
+        assert patch_connect_robust.call_args == mocker.call('amqp://foo:bar@test:1234/', loop=mock_event_loop)
         assert mock_async_connection.channel.call_args == mocker.call()
         assert mock_async_channel.set_qos.call_args == mocker.call(prefetch_count=1)
         assert mock_async_channel.declare_queue.call_args == mocker.call('test_queue', durable=True)
