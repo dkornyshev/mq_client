@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import typing
 import unittest.mock
@@ -18,10 +19,6 @@ LOG_NAME = 'mq_client.producer'
 class MockAsyncProducer:
 
     @pytest.fixture
-    def stub_message(self) -> dict[str, typing.Any]:
-        return {"foo": "bar"}
-
-    @pytest.fixture
     def stub_mq_config(self) -> models.RabbitMQConfig:
         return models.RabbitMQConfig(
             broker_dsn='amqp://foo:bar@test:1234',
@@ -30,6 +27,14 @@ class MockAsyncProducer:
             max_reconnect_attempts=5,
             reconnect_delay=1,
         )
+
+    @pytest.fixture
+    def stub_mq_producer(self, stub_mq_config: models.RabbitMQConfig) -> producer.AsyncProducer:
+        return producer.AsyncProducer(stub_mq_config)
+
+    @pytest.fixture
+    def stub_message(self) -> dict[str, typing.Any]:
+        return {"foo": "bar"}
 
     @pytest.fixture
     def mock_async_channel(self, mocker: pytest_mock.MockFixture) -> typing.Any:
@@ -54,12 +59,16 @@ class MockAsyncProducer:
             ),
         )
 
+    @pytest.fixture
+    def mock_event_loop(self, mocker: pytest_mock.MockFixture) -> asyncio.AbstractEventLoop:
+        return mocker.AsyncMock(spec=asyncio.AbstractEventLoop)
+
     @pytest.fixture(autouse=True)
     def patch_json_dumps(self, mocker: pytest_mock.MockFixture) -> typing.Any:
         return mocker.patch('json.dumps', return_value='"json-dumped message"')
 
     @pytest.fixture(autouse=True)
-    def patch_async_connection_manager_class(
+    def patch_async_connection_manager(
         self,
         mocker: pytest_mock.MockFixture,
         mock_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
@@ -78,10 +87,10 @@ class MockAsyncProducer:
 
 class TestAsyncProducer(MockAsyncProducer):
 
-    async def test_producer(
+    async def test_initialize(
         self,
         stub_mq_config: models.RabbitMQConfig,
-        patch_async_connection_manager_class: unittest.mock.AsyncMock,
+        patch_async_connection_manager: unittest.mock.AsyncMock,
         mock_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
         mocker: pytest_mock.MockFixture,
     ) -> None:
@@ -90,19 +99,33 @@ class TestAsyncProducer(MockAsyncProducer):
         assert mq_producer.connection_manager is mock_async_connection_manager
         assert mq_producer.queue_name == 'test_queue'
 
-        assert patch_async_connection_manager_class.call_args == mocker.call(stub_mq_config)
+        assert patch_async_connection_manager.call_args == mocker.call(stub_mq_config, None)
+
+    async def test_initialize_with_loop(
+        self,
+        stub_mq_config: models.RabbitMQConfig,
+        patch_async_connection_manager: unittest.mock.AsyncMock,
+        mock_event_loop: asyncio.AbstractEventLoop,
+        mock_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
+        mocker: pytest_mock.MockFixture,
+    ) -> None:
+        mq_producer = producer.AsyncProducer(stub_mq_config, mock_event_loop)
+
+        assert mq_producer.connection_manager is mock_async_connection_manager
+        assert mq_producer.queue_name == 'test_queue'
+
+        assert patch_async_connection_manager.call_args == mocker.call(stub_mq_config, mock_event_loop)
 
     async def test_publish(
         self,
         stub_message: dict[str, typing.Any],
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_producer: producer.AsyncProducer,
         mock_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
         mock_async_channel: aio_pika.abc.AbstractRobustChannel,
         mocker: pytest_mock.MockFixture,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        mq_producer = producer.AsyncProducer(stub_mq_config)
-        await mq_producer.publish(stub_message)
+        await stub_mq_producer.publish(stub_message)
 
         assert caplog.record_tuples == [
             (LOG_NAME, logging.DEBUG, "Event published to RabbitMQ with routing key test_queue: {'foo': 'bar'}"),
@@ -116,12 +139,11 @@ class TestAsyncProducer(MockAsyncProducer):
     async def test_publish_routing_key(
         self,
         stub_message: dict[str, typing.Any],
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_producer: producer.AsyncProducer,
         mock_async_channel: aio_pika.abc.AbstractRobustChannel,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        mq_producer = producer.AsyncProducer(stub_mq_config)
-        await mq_producer.publish(stub_message, routing_key='spam')
+        await stub_mq_producer.publish(stub_message, routing_key='spam')
 
         assert mock_async_channel.default_exchange.publish.call_args.kwargs['routing_key'] == 'spam'
 
@@ -132,7 +154,7 @@ class TestAsyncProducer(MockAsyncProducer):
     async def test_publish_get_channel_error(
         self,
         stub_message: dict[str, typing.Any],
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_producer: producer.AsyncProducer,
         mock_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
         mock_async_channel: aio_pika.abc.AbstractRobustChannel,
         caplog: pytest.LogCaptureFixture,
@@ -140,8 +162,7 @@ class TestAsyncProducer(MockAsyncProducer):
         get_channel_error = aio_pika.exceptions.AMQPError('some error')
         mock_async_connection_manager.get_channel.side_effect = [get_channel_error]
 
-        mq_producer = producer.AsyncProducer(stub_mq_config)
-        await mq_producer.publish(stub_message)
+        await stub_mq_producer.publish(stub_message)
 
         assert not mock_async_channel.default_exchange.publish.called
 
@@ -152,16 +173,15 @@ class TestAsyncProducer(MockAsyncProducer):
     async def test_publish_get_channel_error_raise(
         self,
         stub_message: dict[str, typing.Any],
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_producer: producer.AsyncProducer,
         mock_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         get_channel_error = aio_pika.exceptions.AMQPError('some error')
         mock_async_connection_manager.get_channel.side_effect = [get_channel_error]
 
-        mq_producer = producer.AsyncProducer(stub_mq_config)
         with pytest.raises(aio_pika.exceptions.AMQPError) as exc_info:
-            await mq_producer.publish(stub_message, raise_err=True)
+            await stub_mq_producer.publish(stub_message, raise_err=True)
 
         assert exc_info.value is get_channel_error
         assert caplog.record_tuples == [
@@ -171,15 +191,14 @@ class TestAsyncProducer(MockAsyncProducer):
     async def test_publish_error(
         self,
         stub_message: dict[str, typing.Any],
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_producer: producer.AsyncProducer,
         mock_async_channel: aio_pika.abc.AbstractRobustChannel,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         publish_error = aio_pika.exceptions.AMQPError('some error')
         mock_async_channel.default_exchange.publish.side_effect = [publish_error]
 
-        mq_producer = producer.AsyncProducer(stub_mq_config)
-        await mq_producer.publish(stub_message)
+        await stub_mq_producer.publish(stub_message)
 
         assert caplog.record_tuples == [
             (LOG_NAME, logging.ERROR, 'Failed to publish event to RabbitMQ: some error'),
@@ -188,16 +207,15 @@ class TestAsyncProducer(MockAsyncProducer):
     async def test_publish_error_raise(
         self,
         stub_message: dict[str, typing.Any],
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_producer: producer.AsyncProducer,
         mock_async_channel: aio_pika.abc.AbstractRobustChannel,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         publish_error = aio_pika.exceptions.AMQPError('some error')
         mock_async_channel.default_exchange.publish.side_effect = [publish_error]
 
-        mq_producer = producer.AsyncProducer(stub_mq_config)
         with pytest.raises(aio_pika.exceptions.AMQPError) as exc_info:
-            await mq_producer.publish(stub_message, raise_err=True)
+            await stub_mq_producer.publish(stub_message, raise_err=True)
 
         assert exc_info.value is publish_error
         assert caplog.record_tuples == [
@@ -207,16 +225,15 @@ class TestAsyncProducer(MockAsyncProducer):
     async def test_publish_unknown_error(
         self,
         stub_message: dict[str, typing.Any],
-        stub_mq_config: models.RabbitMQConfig,
+        stub_mq_producer: producer.AsyncProducer,
         mock_async_channel: aio_pika.abc.AbstractRobustChannel,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         unknown_error = ValueError('foo')
         mock_async_channel.default_exchange.publish.side_effect = [unknown_error]
 
-        mq_producer = producer.AsyncProducer(stub_mq_config)
         with pytest.raises(ValueError, match='foo') as exc_info:
-            await mq_producer.publish(stub_message)
+            await stub_mq_producer.publish(stub_message)
 
         assert exc_info.value is unknown_error
         assert caplog.record_tuples == [

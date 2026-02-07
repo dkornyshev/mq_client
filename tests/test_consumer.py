@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import typing
@@ -109,8 +110,12 @@ class MockAsyncConsumer:
             get_channel=mocker.AsyncMock(return_value=mock_async_channel),
         )
 
+    @pytest.fixture
+    def mock_event_loop(self, mocker: pytest_mock.MockFixture) -> asyncio.AbstractEventLoop:
+        return mocker.AsyncMock(spec=asyncio.AbstractEventLoop)
+
     @pytest.fixture(autouse=True)
-    def patch_async_connection_manager_class(
+    def patch_async_connection_manager(
         self,
         mock_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
         mocker: pytest_mock.MockFixture,
@@ -148,9 +153,32 @@ class MockAsyncConsumer:
 
 class TestAsyncConsumer(MockAsyncConsumer):
 
-    async def test_consumer(self, stub_mq_consumer: consumer.AsyncConsumer) -> None:
-        assert stub_mq_consumer.queue_name == 'test_queue'
-        assert stub_mq_consumer.connection_manager is not None
+    async def test_initialize(
+        self,
+        stub_mq_config: models.RabbitMQConfig,
+        patch_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
+        mocker: pytest_mock.MockFixture,
+    ) -> None:
+        mq_consumer = consumer.AsyncConsumer(stub_mq_config)
+
+        assert mq_consumer.queue_name == 'test_queue'
+        assert mq_consumer.connection_manager is not None
+
+        assert patch_async_connection_manager.call_args == mocker.call(stub_mq_config, None)
+
+    async def test_initialize_with_loop(
+        self,
+        stub_mq_config: models.RabbitMQConfig,
+        patch_async_connection_manager: manager.RabbitMQAsyncConnectionManager,
+        mock_event_loop: asyncio.AbstractEventLoop,
+        mocker: pytest_mock.MockFixture,
+    ) -> None:
+        mq_consumer = consumer.AsyncConsumer(stub_mq_config, mock_event_loop)
+
+        assert mq_consumer.queue_name == 'test_queue'
+        assert mq_consumer.connection_manager is not None
+
+        assert patch_async_connection_manager.call_args == mocker.call(stub_mq_config, mock_event_loop)
 
     async def test_start_consuming_normal_flow(
         self,

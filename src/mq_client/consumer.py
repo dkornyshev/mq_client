@@ -1,4 +1,5 @@
 """Потребитель сообщений из RabbitMQ."""
+import asyncio
 import json
 import logging
 import typing
@@ -16,9 +17,13 @@ logger = logging.getLogger(__name__)
 class AsyncConsumer:
     """Потребитель (consumer) сообщений из шины RabbitMQ."""
 
-    def __init__(self, mq_config: models.RabbitMQConfig) -> None:
+    def __init__(
+        self,
+        mq_config: models.RabbitMQConfig,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
         """Создать экземпляр потребителя сообщений."""
-        self.connection_manager =  manager.RabbitMQAsyncConnectionManager(mq_config)
+        self.connection_manager =  manager.RabbitMQAsyncConnectionManager(mq_config, loop)
         self.queue_name = mq_config.queue_name
 
         self._consuming = True
